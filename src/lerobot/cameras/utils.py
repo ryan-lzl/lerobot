@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import platform
 from typing import cast
 
@@ -65,12 +66,41 @@ def get_cv2_rotation(rotation: Cv2Rotation) -> int | None:
         return None
 
 
-def get_cv2_backend() -> int:
+def get_cv2_backends() -> list[int]:
+    """
+    Returns a prioritized list of OpenCV backends to try when opening cameras.
+
+    Default (Windows): [CAP_DSHOW, CAP_MSMF, CAP_ANY]
+    Default (others): [CAP_ANY]
+
+    Can be overridden with the env var `LEROBOT_OPENCV_BACKENDS`, e.g.
+    `LEROBOT_OPENCV_BACKENDS=DSHOW,MSMF,ANY`.
+    Unknown tokens are ignored; if nothing valid remains, defaults are used.
+    """
     import cv2
 
+    default_order: list[int]
     if platform.system() == "Windows":
-        return int(cv2.CAP_MSMF)  # Use MSMF for Windows instead of AVFOUNDATION
-    # elif platform.system() == "Darwin":  # macOS
-    #     return cv2.CAP_AVFOUNDATION
-    else:  # Linux and others
-        return int(cv2.CAP_ANY)
+        default_order = [int(cv2.CAP_DSHOW), int(cv2.CAP_MSMF), int(cv2.CAP_ANY)]
+    else:
+        default_order = [int(cv2.CAP_ANY)]
+
+    override = os.environ.get("LEROBOT_OPENCV_BACKENDS")
+    if not override:
+        return default_order
+
+    token_map = {
+        "ANY": int(cv2.CAP_ANY),
+        "DSHOW": int(cv2.CAP_DSHOW),
+        "MSMF": int(cv2.CAP_MSMF),
+        "AVFOUNDATION": int(getattr(cv2, "CAP_AVFOUNDATION", cv2.CAP_ANY)),
+        "V4L": int(getattr(cv2, "CAP_V4L", cv2.CAP_ANY)),
+    }
+
+    backends: list[int] = []
+    for raw_token in override.split(","):
+        token = raw_token.strip().upper()
+        if token in token_map and token_map[token] not in backends:
+            backends.append(token_map[token])
+
+    return backends or default_order

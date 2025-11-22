@@ -35,7 +35,7 @@ import cv2  # type: ignore  # TODO: add type stubs for OpenCV
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 from ..camera import Camera
-from ..utils import get_cv2_backend, get_cv2_rotation
+from ..utils import get_cv2_backends, get_cv2_rotation
 from .configuration_opencv import ColorMode, OpenCVCameraConfig
 
 # NOTE(Steven): The maximum opencv device index depends on your operating system. For instance,
@@ -119,6 +119,11 @@ class OpenCVCamera(Camera):
 
         self.videocapture: cv2.VideoCapture | None = None
 
+        self.backend_order: list[int] = get_cv2_backends()
+        self.chosen_backend: int | None = None
+        self._fallback_backends: list[int] = []
+        self._read_fallback_used: bool = False
+
         self.thread: Thread | None = None
         self.stop_event: Event | None = None
         self.frame_lock: Lock = Lock()
@@ -126,7 +131,6 @@ class OpenCVCamera(Camera):
         self.new_frame_event: Event = Event()
 
         self.rotation: int | None = get_cv2_rotation(config.rotation)
-        self.backend: int = get_cv2_backend()
 
         if self.height and self.width:
             self.capture_width, self.capture_height = self.width, self.height
@@ -160,13 +164,25 @@ class OpenCVCamera(Camera):
         # blocking in multi-threaded applications, especially during data collection.
         cv2.setNumThreads(1)
 
-        self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
+        self._read_fallback_used = False
+        self.chosen_backend = None
+        self._fallback_backends = []
+        self.videocapture = None
 
-        if not self.videocapture.isOpened():
-            self.videocapture.release()
-            self.videocapture = None
+        for idx, backend in enumerate(self.backend_order):
+            capture = cv2.VideoCapture(self.index_or_path, backend)
+            if capture.isOpened():
+                self.videocapture = capture
+                self.chosen_backend = backend
+                self._fallback_backends = self.backend_order[idx + 1 :]
+                logger.info(f"{self} opened with backend={capture.getBackendName()} ({backend}).")
+                break
+            capture.release()
+
+        if not self.is_connected:
+            attempted = ", ".join(str(b) for b in self.backend_order)
             raise ConnectionError(
-                f"Failed to open {self}.Run `lerobot-find-cameras opencv` to find available cameras."
+                f"Failed to open {self} with backends [{attempted}].Run `lerobot-find-cameras opencv` to find available cameras."
             )
 
         self._configure_capture_settings()
@@ -307,35 +323,52 @@ class OpenCVCamera(Camera):
         else:
             targets_to_scan = [int(i) for i in range(MAX_OPENCV_INDEX)]
 
+        backend_order = get_cv2_backends()
+
         for target in targets_to_scan:
-            camera = cv2.VideoCapture(target)
-            if camera.isOpened():
-                default_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
-                default_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                default_fps = camera.get(cv2.CAP_PROP_FPS)
-                default_format = camera.get(cv2.CAP_PROP_FORMAT)
+            camera = None
+            backend_used = None
 
-                # Get FOURCC code and convert to string
-                default_fourcc_code = camera.get(cv2.CAP_PROP_FOURCC)
-                default_fourcc_code_int = int(default_fourcc_code)
-                default_fourcc = "".join([chr((default_fourcc_code_int >> 8 * i) & 0xFF) for i in range(4)])
+            for backend in backend_order:
+                candidate = cv2.VideoCapture(target, backend)
+                if candidate.isOpened():
+                    camera = candidate
+                    backend_used = backend
+                    break
+                candidate.release()
 
-                camera_info = {
-                    "name": f"OpenCV Camera @ {target}",
-                    "type": "OpenCV",
-                    "id": target,
-                    "backend_api": camera.getBackendName(),
-                    "default_stream_profile": {
-                        "format": default_format,
-                        "fourcc": default_fourcc,
-                        "width": default_width,
-                        "height": default_height,
-                        "fps": default_fps,
-                    },
-                }
+            if camera is None:
+                continue
 
-                found_cameras_info.append(camera_info)
-                camera.release()
+            default_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+            default_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            default_fps = camera.get(cv2.CAP_PROP_FPS)
+            default_format = camera.get(cv2.CAP_PROP_FORMAT)
+
+            # Get FOURCC code and convert to string
+            default_fourcc_code = camera.get(cv2.CAP_PROP_FOURCC)
+            default_fourcc_code_int = int(default_fourcc_code)
+            default_fourcc = "".join([chr((default_fourcc_code_int >> 8 * i) & 0xFF) for i in range(4)])
+
+            backend_name = camera.getBackendName()
+
+            camera_info = {
+                "name": f"OpenCV Camera @ {target}",
+                "type": "OpenCV",
+                "id": target,
+                "backend_api": backend_name,
+                "backend_api_used": backend_name,
+                "default_stream_profile": {
+                    "format": default_format,
+                    "fourcc": default_fourcc,
+                    "width": default_width,
+                    "height": default_height,
+                    "fps": default_fps,
+                },
+            }
+
+            found_cameras_info.append(camera_info)
+            camera.release()
 
         return found_cameras_info
 
@@ -373,7 +406,10 @@ class OpenCVCamera(Camera):
         ret, frame = self.videocapture.read()
 
         if not ret or frame is None:
-            raise RuntimeError(f"{self} read failed (status={ret}).")
+            fallback_frame = self._attempt_fallback_backend_read()
+            if fallback_frame is None:
+                raise RuntimeError(f"{self} read failed (status={ret}).")
+            frame = fallback_frame
 
         processed_frame = self._postprocess_image(frame, color_mode)
 
@@ -381,6 +417,48 @@ class OpenCVCamera(Camera):
         logger.debug(f"{self} read took: {read_duration_ms:.1f}ms")
 
         return processed_frame
+
+    def _attempt_fallback_backend_read(self) -> NDArray[Any] | None:
+        """
+        Try reopening the camera with the remaining backends once after a read failure.
+        """
+        if self._read_fallback_used or not self._fallback_backends:
+            return None
+
+        self._read_fallback_used = True
+
+        if self.videocapture is not None:
+            self.videocapture.release()
+            self.videocapture = None
+
+        while self._fallback_backends:
+            backend = self._fallback_backends.pop(0)
+            capture = cv2.VideoCapture(self.index_or_path, backend)
+
+            if not capture.isOpened():
+                capture.release()
+                continue
+
+            self.videocapture = capture
+            self.chosen_backend = backend
+            logger.info(f"{self} retrying with fallback backend={capture.getBackendName()} ({backend}).")
+
+            try:
+                self._configure_capture_settings()
+                ret, frame = self.videocapture.read()
+            except Exception as e:
+                logger.warning(f"{self} fallback backend {backend} failed during configure/read: {e}")
+                ret, frame = False, None
+
+            if ret and frame is not None:
+                return frame
+
+            # Clean up and try the next backend
+            if self.videocapture is not None:
+                self.videocapture.release()
+                self.videocapture = None
+
+        return None
 
     def _postprocess_image(self, image: NDArray[Any], color_mode: ColorMode | None = None) -> NDArray[Any]:
         """
